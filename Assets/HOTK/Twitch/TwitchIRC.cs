@@ -3,6 +3,13 @@ using UnityEngine;
 using System.Collections;
 using System.Collections.Generic;
 using System.Threading;
+using System.IO;
+using System.Net;
+using Newtonsoft.Json;
+using System.Linq;
+using System.Security.Cryptography.X509Certificates;
+using System.Net.Security;
+using System.Net.Cache;
 
 public class TwitchIRC : MonoBehaviour
 {
@@ -29,8 +36,14 @@ public class TwitchIRC : MonoBehaviour
     private bool _connected;
     private bool _loggedin;
 
+    private String twitchApiUrl = null;
+    private String lastNewFollower = null;
+
+
     public void StartIRC()
     {
+        twitchApiUrl = "https://api.twitch.tv/kraken/channels/CmdrKuixote/follows";
+
         _stopThreads = false;
         _commandQueue.Clear();
         _recievedMsgs.Clear();
@@ -44,7 +57,7 @@ public class TwitchIRC : MonoBehaviour
         var networkStream = sock.GetStream();
         var input = new System.IO.StreamReader(networkStream);
         var output = new System.IO.StreamWriter(networkStream);
-        
+
         _loggedin = false;
         _connected = false;
         //Send PASS & NICK.
@@ -79,15 +92,101 @@ public class TwitchIRC : MonoBehaviour
         }
     }
 
+    public class User
+    {
+        public long _id { get; set; }
+        public string name { get; set; }
+        public DateTime created_at { get; set; }
+        public DateTime updated_at { get; set; }
+        public Dictionary<string, string> _links { get; set; }
+        public string display_name { get; set; }
+        public object logo { get; set; }
+        public object bio { get; set; }
+        public string type { get; set; }
+    }
+
+    public class Follow
+    {
+        public DateTime created_at { get; set; }
+        public Dictionary<string, string> _links { get; set; }
+        public bool notifications { get; set; }
+        public User user { get; set; }
+    }
+
+    public class RootObject
+    {
+        public RootObject()
+        {
+            this.follows = new List<Follow>();
+        }
+        public List<Follow> follows { get; set; }
+        public int _total { get; set; }
+        public Dictionary<string, string> _links { get; set; }
+    }
+
+
+    public bool MyRemoteCertificateValidationCallback(System.Object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors)
+    {
+        bool isOk = true;
+        // If there are errors in the certificate chain, look at each error to determine the cause.
+        if (sslPolicyErrors != SslPolicyErrors.None)
+        {
+            for (int i = 0; i < chain.ChainStatus.Length; i++)
+            {
+                if (chain.ChainStatus[i].Status != X509ChainStatusFlags.RevocationStatusUnknown)
+                {
+                    chain.ChainPolicy.RevocationFlag = X509RevocationFlag.EntireChain;
+                    chain.ChainPolicy.RevocationMode = X509RevocationMode.Online;
+                    chain.ChainPolicy.UrlRetrievalTimeout = new TimeSpan(0, 1, 0);
+                    chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllFlags;
+                    bool chainIsValid = chain.Build((X509Certificate2)certificate);
+                    if (!chainIsValid)
+                    {
+                        isOk = false;
+                    }
+                }
+            }
+        }
+        return isOk;
+    }
+
     private void IRCInputProcedure(System.IO.TextReader input, System.Net.Sockets.NetworkStream networkStream)
     {
+        long apiSleepTime = 0;
+        ServicePointManager.ServerCertificateValidationCallback = MyRemoteCertificateValidationCallback;
+
+        WebClient wc = new WebClient();
+
         while (!_stopThreads)
         {
             try
             {
+                if (apiSleepTime > 10000)
+                {
+                    string json =wc.DownloadString(twitchApiUrl);
+                    var result = JsonConvert.DeserializeObject<RootObject>(json);
+                    var latestFollow = result.follows.Aggregate((Follow)null, (f1, f2) => (f1 == null || f2 == null ? f1 ?? f2 : f2.created_at > f1.created_at ? f2 : f1));
+
+                    if (lastNewFollower == null)
+                    {
+                        lastNewFollower = latestFollow.user.display_name;
+                    }
+                    else if (lastNewFollower.Equals(latestFollow.user.display_name) == false)
+                    {
+                        lock (_recievedMsgs)
+                        {
+                            _recievedMsgs.Add(ToTwitchNotice("New follower: \"" + latestFollow.user.display_name + "\"."));
+                            lastNewFollower = latestFollow.user.display_name;
+                        }
+                    }
+
+                    apiSleepTime = 0;
+                }
+
                 if (!networkStream.DataAvailable)
                 {
                     Thread.Sleep(20);
+                    apiSleepTime += 20;
                     continue;
                 }
 
@@ -198,7 +297,7 @@ public class TwitchIRC : MonoBehaviour
                     Thread.Sleep(20);
                     continue;
                 }
-                // https://github.com/justintv/Twitch-API/blob/master/IRC.md#command--message-limit 
+                // https://github.com/justintv/Twitch-API/blob/master/IRC.md#command--message-limit
                 //has enough time passed since we last sent a message/command?
                 if (stopWatch.ElapsedMilliseconds <= 1750)
                 {
